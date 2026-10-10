@@ -1,0 +1,19 @@
+# Environment variables and secrets
+pulse-api/.env
+pulse-api/.env.*
+
+# Keep an example configuration file if we add one later
+!pulse-api/.env.example
+
+# Local SQLite database and auxiliary files
+pulse-api/db/*.db
+pulse-api/db/*.db-shm
+pulse-api/db/*.db-wal
+
+# Go build artifacts
+pulse-api/pulse.exe
+pulse-api/*.exe
+
+# Test and coverage outputs
+pulse-api/coverage.out
+pulse-api/*.test
