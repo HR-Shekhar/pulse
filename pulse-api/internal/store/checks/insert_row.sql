@@ -1,5 +1,4 @@
--- Inserts one check. saveCheck fills each ? in this column order.
--- The Error name is the table's error column; SQLite matches them case-insensitively.
+-- Insert one check row; bind checked_at, url, status, response_ms, error.
 INSERT INTO checks (checked_at, url, status, response_ms, Error)
 VALUES (
     ?,

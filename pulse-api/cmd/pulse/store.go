@@ -6,8 +6,7 @@ import (
 	"time"
 )
 
-// migrate reads the create-table SQL file and runs it on the open database.
-// IF NOT EXISTS leaves an existing checks table unchanged on a later call.
+// migrate creates the checks table if it does not already exist.
 func migrate(db *sql.DB) error {
 	migrationSQL, err := os.ReadFile("db/migrations/0001_create_checks_table.sql")
 	if err != nil {
@@ -18,8 +17,7 @@ func migrate(db *sql.DB) error {
 	return err
 }
 
-// saveCheck inserts one pingResponse into checks using insert_row.sql.
-// A nil Err is stored as an empty string because the error column holds text.
+// saveCheck inserts one pingResponse into checks; nil Err is stored as "".
 func saveCheck(db *sql.DB, r pingResponse) error {
 	insertQuery, err := os.ReadFile("internal/store/checks/insert_row.sql")
 	if err != nil {
@@ -42,8 +40,7 @@ func saveCheck(db *sql.DB, r pingResponse) error {
 	return err
 }
 
-// readCheck runs the SQL in read_row.sql and turns each database row into one dbResponse. 
-// It returns those records as a slice, newest first, up to limit.
+// readCheck returns up to limit checks, newest first.
 func readCheck(db *sql.DB, limit int) ([]dbResponse, error) {
 	query, err := os.ReadFile("internal/store/checks/read_row.sql")
 	if err != nil {
@@ -62,12 +59,12 @@ func readCheck(db *sql.DB, limit int) ([]dbResponse, error) {
 		var row dbResponse
 		var responseMs int64
 		rows.Scan(
-		&row.ID,
-		&row.CheckedAt,
-		&row.URL,
-		&row.Status,
-		&responseMs,
-		&row.Err,
+			&row.ID,
+			&row.CheckedAt,
+			&row.URL,
+			&row.Status,
+			&responseMs,
+			&row.Err,
 		)
 		row.Duration = time.Duration(responseMs) * time.Millisecond
 		checks = append(checks, row)

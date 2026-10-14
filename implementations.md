@@ -1,655 +1,792 @@
-# Pulse - Finite Implementation Roadmap
+# Pulse: Detailed Implementation Checklist
 
-**Purpose:** Build Pulse into a usable, deployable uptime-monitoring product while learning Go concurrency, backend engineering, system design, and the fundamentals of distributed systems.
+## How to use this document
 
-**Completion rule:** This roadmap has **24 implementation steps**. Finish the acceptance criteria for each step, record the result, and move on. Do not add features or redesign completed steps unless a real bug, security issue, or unmet requirement demands it.
+This is the execution checklist for Pulse. The product scope and
+technical decisions are frozen for v1. Work in order, finish the
+acceptance criteria, commit, and move on. Do not add features just
+because they sound interesting.
 
-This is a learning guide, not a dump of finished code. You write the implementation. For each step, understand the design, implement the smallest useful slice, test it, and explain it in your own words.
+**Working style** 1. Work on one numbered step at a time. 2. Complete
+its checkboxes in order. A substep is a concrete action, not a research
+rabbit hole. 3. Ask for an explanation when a concept is new. Understand
+the purpose and the important lines, but do not try to memorize every
+library detail. 4. Run the listed checks at the end of a meaningful
+batch, not after every line. 5. If a known issue does not block the
+current acceptance criteria, record it and continue. 6. Keep changes
+small enough to debug, but large enough to finish features quickly. 7.
+Commit when the step's acceptance criteria pass.
 
----
+## Product scope
 
-## 1. Product definition and scope freeze
+Pulse lets registered users monitor HTTP/HTTPS URLs. It checks them on a
+schedule, stores results, shows current status and history, opens
+incidents after sustained failures, and sends webhook alerts.
 
-Pulse lets a registered user monitor HTTP/HTTPS URLs. It checks them on a schedule, stores results, shows current status and history, and creates incidents and alerts when a target becomes unhealthy.
+### Required for v1
 
-### The finished product must support
+-   Registration and login.
+-   Authenticated monitor create, list, view, update, enable/disable,
+    and delete.
+-   Validated check intervals.
+-   Separate API and worker processes.
+-   PostgreSQL persistence and durable scheduled jobs.
+-   Check history and latest status.
+-   Incident opening and recovery.
+-   Webhook alerts.
+-   A simple usable dashboard.
+-   Tests, logs, metrics, health checks, Docker Compose, CI, deployment
+    instructions, and README.
 
-- User registration and login.
-- Authenticated monitor create, list, view, update, enable/disable, and delete operations.
-- Configurable check interval within documented safe limits.
-- Scheduled HTTP checks performed by a separate worker process.
-- Persistent check history and a current status view.
-- Incident creation on a sustained failure and recovery when the target becomes healthy again.
-- User-configured webhook alerts (Discord-compatible webhook is sufficient).
-- A usable dashboard.
-- Local development through Docker Compose and a documented deployment path.
-- Automated tests, structured logs, health/readiness endpoints, metrics, and a useful README.
+### Explicitly not in v1
 
-### Explicitly out of scope for this version
+Kubernetes, Kafka, service meshes, multi-region deployment, billing,
+teams, OAuth, mobile apps, AI summaries, plugin systems, or a
+microservices rewrite.
 
-Do **not** add Kubernetes, Kafka, service meshes, multi-region deployment, billing, teams/organizations, OAuth, mobile apps, AI-generated incident summaries, arbitrary plugins, or a microservices rewrite. These can become separate projects after this version is complete.
+## Fixed technical decisions
 
-### Fixed technical direction
+  -----------------------------------------------------------------------
+  Area                                Decision
+  ----------------------------------- -----------------------------------
+  Language                            Go
 
-| Concern | Decision |
-|---|---|
-| Language | Go |
-| HTTP API | Gin |
-| Database | PostgreSQL |
-| ORM (ordinary database operations) | GORM (`gorm.io/gorm`) |
-| PostgreSQL dialect/driver for GORM | `gorm.io/driver/postgres` |
-| Migrations | Goose, with versioned SQL migration files |
-| Configuration | Environment variables with validation |
-| Logging | Go `slog` with structured fields |
-| API documentation | OpenAPI, added after routes stabilize |
-| Local environment | Docker Compose |
-| Tests | Go `testing`; integration tests against PostgreSQL |
-| Frontend | Keep it simple: server-rendered HTML/templates or a small separate frontend. Do not let frontend work delay the backend. |
-| Distributed work | A separate Go worker process using PostgreSQL as a durable job queue |
-| Metrics | Prometheus-compatible metrics endpoint/library |
-| CI | GitHub Actions or equivalent |
+  HTTP API                            Gin
 
-**Why no Redis or Kafka yet?** PostgreSQL can provide durable job storage and coordination for this project's first distributed-worker design. A separate API process and worker process already introduce meaningful real-world problems: competing consumers, leases, retries, duplicate execution, process crashes, and graceful shutdown. Add a broker only if you can identify a concrete limitation that the current design cannot meet.
+  Database                            PostgreSQL
 
----
+  Ordinary database operations        GORM with `gorm.io/gorm` and
+                                      `gorm.io/driver/postgres`
 
-## 2. Architecture to aim for
+  Schema migrations                   Goose with versioned SQL files
 
-This is the target shape, not a requirement to create every package on day one.
+  Configuration                       Environment variables with
+                                      validation
 
-```text
-                    Browser / API Client
-                            |
-                            v
-                    +----------------+
-                    | Gin HTTP API   |
-                    | auth + CRUD    |
-                    +-------+--------+
-                            |
-                            v
-                    +----------------+
-                    | PostgreSQL     |
-                    | users          |
-                    | monitors       |
-                    | check history  |
-                    | jobs           |
-                    | incidents      |
-                    +---+---------+--+
-                        ^         |
-        claim due jobs  |         | query/update monitors
-                        |         v
-                 +------+---------+------+
-                 | Pulse Worker          |
-                 | scheduler/dispatcher  |
-                 | bounded check workers |
-                 | incident/alert logic  |
-                 +-----------+-----------+
-                             |
-                             v
-                     Monitored HTTP URLs
+  Logging                             Go `slog`
 
-                 Worker/API -> logs, metrics, health
-                 Alert processor -> configured webhook
+  API contract                        OpenAPI after routes stabilize
+
+  Local environment                   Docker Compose
+
+  Tests                               Go `testing`, including PostgreSQL
+                                      integration tests
+
+  Background work                     Separate Go worker using PostgreSQL
+                                      as a durable queue
+
+  Metrics                             Prometheus-compatible
+
+  CI                                  GitHub Actions or equivalent
+
+  Frontend                            Server-rendered templates or a
+                                      small separate frontend; do not let
+                                      it delay the backend
+  -----------------------------------------------------------------------
+
+Goose owns schema changes. Do not replace reviewed SQL migrations with
+GORM `AutoMigrate`. Use raw, parameterized SQL for PostgreSQL-specific
+locking when needed.
+
+## Target architecture
+
+``` text
+Browser / API client
+        |
+        v
+    Gin API ---------> PostgreSQL <--------- Pulse worker
+    auth + CRUD        users                  scheduler/dispatcher
+                       monitors               bounded check workers
+                       check history           incidents and alerts
+                       jobs
+        |                                         |
+        v                                         v
+ health, logs, metrics                       monitored URLs
 ```
 
-### Responsibility boundaries
-
-- **API:** validates requests, authenticates users, enforces ownership, and calls application operations. It does not perform scheduled URL checks inside user-facing requests.
-- **Application/domain logic:** owns monitor rules, status transitions, incident rules, and validation that is not specific to HTTP.
-- **Persistence:** PostgreSQL, GORM for ordinary database operations, explicit transactions, and Goose migrations. Use carefully scoped raw SQL for operations that need precise PostgreSQL behavior, such as concurrent job claiming.
-- **Worker:** claims due work, executes checks with bounded concurrency, persists results, and triggers incident/alert processing.
-- **Checker:** performs one HTTP probe and returns a structured result. It should not know about Gin or user authentication.
-- **Alert sender:** sends notifications with timeouts and bounded retries. An alert failure must not crash monitoring.
-
-Keep these as packages and processes with clear responsibilities. Do not turn each package into a network service without a reason.
-
----
-
-## 3. How to work through the roadmap
-
-For every step:
-
-1. Read the goal and acceptance criteria.
-2. Draw or write the data flow before coding.
-3. Identify inputs, outputs, state, failure cases, and which component owns each decision.
-4. Implement only what the step requires.
-5. Run tests and deliberately trigger at least one failure.
-6. Write a short note: **what I learned, what can fail, and why I chose this design**.
-7. Commit the working step to Git.
-
-Do not move on while the core behavior is broken. Do not wait for perfection once the acceptance criteria pass.
-
----
-
-# Phase A - Understand and stabilize the existing checker
-
-## Step 1 - Establish a reproducible baseline
-
-**Goal:** Know exactly what the current code does before changing it.
-
-**Do:**
-- Record the current directory tree, Go version, module path, and dependencies.
-- Run the current program and inspect the SQLite rows.
-- Run `go test ./...` and `go vet ./...`; record existing failures rather than hiding them.
-- Add a README note describing the current behavior and limitations.
-- Commit the baseline.
-
-**Think about:** Which parts are working behavior, and which are merely imported or declared but unused?
-
-**Done when:**
-- You can run the current program from a documented command.
-- You can explain its execution order from `main`.
-- You have recorded the known gaps: one-shot execution, ticker not consumed, hardcoded URLs, and no API/user model.
-
-## Step 2 - Make one check correct and testable
-
-**Goal:** Define the behavior of a single HTTP probe independently of storage and scheduling.
-
-**Do:**
-- Move the checker into a focused package when it makes the code easier to test.
-- Define a result type containing target URL, start/finish time or check time, HTTP status code, UP/DOWN classification, latency, and a failure reason.
-- Reuse an `http.Client` with a configured timeout instead of constructing one for every URL.
-- Use request contexts and close response bodies.
-- Document the rule for classifying HTTP status codes. A received `500` is an HTTP response, not a transport error.
-- Test success, non-success HTTP status, invalid URL, timeout, and connection failure using `httptest` or controlled test servers.
-
-**Think about:** What does “UP” mean? Is it “an HTTP response arrived,” or “the response meets the monitor's configured expectation”? Choose a clear initial rule.
-
-**Done when:**
-- The checker has no database or Gin dependency.
-- Tests do not require access to public websites.
-- Results distinguish HTTP status from network/timeout errors.
-
-## Step 3 - Learn bounded concurrency
-
-**Goal:** Understand goroutines, `WaitGroup`, races, and resource limits before building a long-running worker.
-
-**Do:**
-- Keep a small sequential baseline and compare it with concurrent checks.
-- Introduce a configurable maximum number of checks running at once.
-- Use a fixed worker pool or a semaphore-based limit; pick one approach and explain it.
-- Ensure all work is joined before the round returns.
-- Run `go test -race ./...`.
-- Test with enough fake targets to prove the concurrency limit is respected.
-
-**Think about:** A goroutine is cheap, but sockets, memory, remote services, database connections, and rate limits are not unlimited. Why is “one goroutine per monitor” not a sufficient capacity policy?
-
-**Done when:**
-- The number of active checks never exceeds the configured limit.
-- The program waits for all work or cancels it according to the documented policy.
-- You can explain the difference between concurrency and parallelism.
-- Race detection passes for the tested paths.
-
-## Step 4 - Define persistence boundaries and move to PostgreSQL
-
-**Goal:** Replace SQLite with PostgreSQL and learn how GORM maps Go code to relational data without hiding the underlying database concepts.
-
-**Do:**
-- Add PostgreSQL to local Docker Compose.
-- Create versioned Goose SQL migrations for the initial schema. Goose owns schema changes; do not use GORM AutoMigrate as a replacement for reviewed migrations.
-- Use GORM (`gorm.io/gorm`) with its PostgreSQL driver (`gorm.io/driver/postgres`) for ordinary database operations.
-- Introduce tables for users, monitors, check results, incidents, and jobs only when the relevant steps require them. Do not create speculative tables for future features.
-- Use appropriate constraints, foreign keys, timestamps with time zones, and indexes based on actual queries.
-- Keep database operations out of the checker.
-- Learn to inspect the SQL generated by GORM, check returned errors, and use transactions where multiple changes must succeed or fail together.
-- Keep raw SQL available for operations that need precise PostgreSQL behavior, such as job claiming with `FOR UPDATE SKIP LOCKED`. Start with GORM for ordinary CRUD; do not force every query through the ORM.
-- Test migration up/down behavior where supported by the chosen migration strategy.
-
-**Think about:** A schema is part of the product contract. Which queries must be fast: latest status, a monitor's recent history, due jobs, or a user's monitor list? GORM can make routine operations shorter, but it does not remove the need to understand SQL, indexes, constraints, or transactions.
-
-**Done when:**
-- PostgreSQL starts locally through documented commands.
-- Goose migrations create the required schema from an empty database.
-- GORM connects to PostgreSQL and can perform tested create/read/update/delete operations.
-- The checker and storage layer have separate responsibilities.
-
----
-
-# Phase B - Build the usable backend
-
-## Step 5 - Create the Gin API skeleton
-
-**Goal:** Start an HTTP API with explicit configuration and lifecycle.
-
-**Do:**
-- Organize the entry point under `cmd/pulse-api`.
-- Load and validate configuration from environment variables.
-- Configure Gin, request logging, request IDs, panic recovery, and sensible HTTP timeouts.
-- Add `GET /health/live` and `GET /health/ready`. Readiness should check dependencies the API actually needs.
-- Use `http.Server` rather than relying on a bare `gin.Engine.Run` for lifecycle control.
-- Add a clean shutdown path using signal-aware contexts.
-
-**Think about:** Liveness answers “is this process alive?” Readiness answers “should it receive traffic?” They are not the same question.
-
-**Done when:**
-- The API starts with valid configuration and fails clearly with invalid configuration.
-- Health endpoints have documented semantics.
-- SIGINT/SIGTERM triggers graceful shutdown.
-
-## Step 6 - Define the monitor API contract
-
-**Goal:** Decide what the API accepts and returns before adding persistence-heavy handlers.
-
-**Do:**
-- Define request/response structures for create, list, get, update, enable/disable, and delete monitor operations.
-- Choose consistent JSON field names and error response format.
-- Validate URL scheme, host, interval bounds, and input sizes.
-- Define pagination for monitor history.
-- Write a minimal OpenAPI specification or equivalent route documentation.
-
-**Think about:** API contracts are consumed by clients. Avoid returning database models directly or exposing internal fields accidentally.
-
-**Done when:**
-- Each route, status code, request body, and response body is documented.
-- Invalid inputs have consistent errors.
-- You can demonstrate the contract using curl or an API client.
-
-## Step 7 - Add users and secure authentication
-
-**Goal:** Make monitor ownership real and enforce it at the API boundary and in database queries.
-
-**Do:**
-- Implement registration and login with a maintained password-hashing library and safe parameters.
-- Never store plaintext passwords or log credentials.
-- Choose one authentication model and document it. For a first API, short-lived access tokens with a carefully designed refresh mechanism are acceptable; secure server-side sessions are also valid.
-- Keep secrets in environment configuration and provide a safe example file with placeholders.
-- Add authentication middleware and an authenticated identity to request context.
-- Test invalid credentials, expired/invalid tokens or sessions, and missing authentication.
-
-**Think about:** Authentication establishes who the caller is. Authorization decides what that caller is allowed to access.
-
-**Done when:**
-- Passwords are securely hashed.
-- Protected endpoints reject unauthenticated requests.
-- Secrets are not committed or logged.
-- Tests cover the main authentication failures.
-
-## Step 8 - Implement monitor CRUD with ownership checks
-
-**Goal:** Let each user manage only their own monitors.
-
-**Do:**
-- Implement create, list, get, update, enable/disable, and delete.
-- Obtain the owner ID from authenticated identity, never from a trusted-looking request field.
-- Scope reads and mutations by both monitor ID and owner ID.
-- Add database constraints and handle not-found/conflict cases intentionally.
-- Use transactions if an operation changes multiple related records.
-- Add unit and PostgreSQL integration tests.
-
-**Think about:** A random monitor ID is not authorization. Ask “does this record belong to this user?” on every user-scoped operation.
-
-**Done when:**
-- Two users can create monitors independently.
-- One user cannot read, modify, or delete the other's monitor.
-- CRUD and ownership tests pass against PostgreSQL.
-
-## Step 9 - Store and query check history
-
-**Goal:** Make history useful for the product, not just a debugging log.
-
-**Do:**
-- Store each check against a monitor ID.
-- Record check time, status, latency, HTTP status code when available, and a bounded/sanitized failure reason.
-- Implement a paginated history endpoint ordered by time and a latest-status query.
-- Add indexes based on these query patterns.
-- Decide a reasonable retention policy for the first version and document it.
-
-**Think about:** Current state and historical events are different. History answers “what happened?” Current status answers “what is the latest known result?”
-
-**Done when:**
-- A monitor's history survives API and worker restarts.
-- The latest result is correct.
-- History pagination is stable and does not return another user's data.
-
----
-
-# Phase C - Scheduling and distributed workers
-
-## Step 10 - Specify the scheduling rules
-
-**Goal:** Decide when work is due before implementing the scheduler.
-
-**Do:**
-- Define how a monitor's next check time is calculated.
-- Define what happens when a monitor is disabled, deleted, or edited while a check is pending.
-- Define the minimum and maximum check interval.
-- Decide whether missed intervals are skipped or caught up. For this version, skip accumulated missed intervals rather than enqueueing an unlimited backlog.
-- Draw the flow from a due monitor to a durable job.
-
-**Think about:** A scheduler determines when work should happen; a worker performs the work. Mixing those responsibilities makes failure handling harder.
-
-**Done when:**
-- The scheduling policy fits on one page.
-- The behavior for missed intervals and monitor edits is explicit.
-- You can describe what survives a process restart.
-
-## Step 11 - Build a durable PostgreSQL job queue
-
-**Goal:** Store scheduled work so it survives process crashes and can be claimed by multiple worker processes.
-
-**Do:**
-- Add a jobs table with fields such as job ID, monitor ID, scheduled time, state, attempt count, lease/claim expiry, and creation time.
-- Add the indexes needed to find due, claimable jobs.
-- Claim jobs in a short transaction using PostgreSQL locking patterns such as `FOR UPDATE SKIP LOCKED`. Use GORM transactions where useful, and use parameterized raw SQL for the locking query if that makes the behavior clearer and more precise.
-- Commit the claim before performing network I/O. Do not hold a database transaction open while waiting for a target URL.
-- Define job states and legal transitions.
-- Make job creation and rescheduling safe against repeated scheduler passes.
-
-**Think about:** Multiple workers may race for the same work. A claim must be coordinated by the database, not by an in-memory mutex that exists only inside one process.
-
-**Done when:**
-- Two local worker processes can compete for jobs without normally claiming the same active job.
-- Claims are durable and have an expiry/recovery policy.
-- No transaction remains open during an HTTP probe.
-
-## Step 12 - Create the separate worker executable
-
-**Goal:** Run API and background processing as separate processes from the same repository.
-
-**Do:**
-- Add `cmd/pulse-worker`.
-- Reuse the checker, configuration, database, and application logic packages where appropriate.
-- Implement a dispatcher that claims due jobs and sends them to a bounded pool of check workers.
-- Apply timeouts and cancellation to each probe.
-- Persist results and schedule the next check according to Step 10.
-- Keep the worker independent of Gin.
-
-**Think about:** A process boundary changes failure behavior. The API can remain available while a worker restarts, but queued work must remain durable.
-
-**Done when:**
-- API and worker can run independently.
-- Restarting the worker does not erase queued jobs or history.
-- Concurrency limits apply across a worker process.
-
-## Step 13 - Handle crashes, leases, retries, and duplicates
-
-**Goal:** Make background processing recover instead of silently losing work.
-
-**Do:**
-- Recover jobs whose lease expired after a worker crash.
-- Use bounded retries with backoff for retryable infrastructure failures.
-- Separate retryable failures from permanent/invalid work.
-- Ensure repeated job delivery does not create duplicate check records or corrupt monitor state. Choose and document an idempotency strategy.
-- Make worker shutdown stop new claims, cancel or finish in-flight checks according to policy, and release or allow expiry of claims safely.
-- Add tests for worker termination after claim, timeout, database interruption, and retry exhaustion.
-
-**Think about:** Do not claim “exactly once” execution. A worker can perform an action and crash before acknowledging it. Design for at-least-once delivery and idempotent effects where practical.
-
-**Done when:**
-- Expired claims can be recovered.
-- Retries are bounded.
-- Duplicate delivery does not create duplicate logical effects.
-- Failure behavior is documented and tested.
-
-## Step 14 - Test multi-process coordination
-
-**Goal:** Demonstrate that the design works across processes, not only goroutines.
-
-**Do:**
-- Run two or more worker instances against the same PostgreSQL database.
-- Enqueue more jobs than one worker can handle.
-- Verify jobs are claimed, processed, and recorded.
-- Kill a worker while it owns work and verify recovery after lease expiry.
-- Test the worker under database contention.
-- Record the limits of the design: PostgreSQL is the queue for this version and can become a bottleneck at higher scale.
-
-**Think about:** A mutex protects shared memory inside a process. Database locks and durable state coordinate independent processes. They solve different problems.
-
-**Done when:**
-- A repeatable integration test exercises multiple workers.
-- Crash recovery is demonstrated.
-- You can explain the job lifecycle and its failure windows without looking at the code.
-
----
-
-# Phase D - Incidents, alerts, and user experience
-
-## Step 15 - Implement incident state transitions
-
-**Goal:** Turn individual check results into meaningful incidents.
-
-**Do:**
-- Define a simple policy, for example: open an incident after three consecutive failed checks and resolve it after a successful check.
-- Store incident start, resolution, monitor ID, and relevant summary fields.
-- Ensure repeated failed checks do not open a new incident every time.
-- Handle recovery and repeated outages.
-- Use transactions or guarded updates so concurrent workers cannot create inconsistent incident state.
-
-**Think about:** A failed check is an observation. An incident is a stateful product concept derived from a sequence of observations.
-
-**Done when:**
-- Consecutive failures open one incident.
-- Recovery resolves the active incident.
-- Repeated failures do not create duplicate active incidents.
-
-## Step 16 - Send webhook alerts reliably enough for v1
-
-**Goal:** Notify users about incident opening and recovery without blocking monitoring.
-
-**Do:**
-- Allow a user to configure a webhook destination with clear validation and ownership.
-- Send notifications from a separate asynchronous path backed by durable work, or another explicitly documented retryable mechanism.
-- Use timeouts, bounded retries, and sanitized logs.
-- Avoid sending secrets in logs or exposing them in API responses.
-- Consider webhook SSRF risks: restrict schemes, reject local/private destinations where appropriate, and document remaining limitations.
-- Ensure a failed webhook does not prevent the check result from being saved.
-
-**Think about:** Alert delivery is an external dependency. Monitoring must keep working when the notification provider is down.
-
-**Done when:**
-- Incident-open and incident-resolved events can generate notifications.
-- Notification failures are retried within a defined limit.
-- A failed webhook cannot crash the worker or lose the check result.
-
-## Step 17 - Build the dashboard
-
-**Goal:** Make Pulse usable by someone other than its developer.
-
-**Do:**
-- Provide sign-up/login and a clear monitor list.
-- Show current status, last check time, latency, and incident state.
-- Add a monitor form, monitor detail page, and recent history view.
-- Include loading, empty, validation-error, and API-error states.
-- Make status distinguishable without relying on color alone.
-- Keep visual scope focused. Do not build a general-purpose frontend framework.
-
-**Think about:** The UI should reflect the API's actual state. Do not invent a status locally when the backend has not confirmed it.
-
-**Done when:**
-- A user can sign up, add a URL, see its latest result, and inspect history without using curl.
-- Common failure states are understandable.
-- The layout works on desktop and a narrow screen.
-
----
-
-# Phase E - Production readiness and project finish
-
-## Step 18 - Add configuration and operational safety
-
-**Goal:** Make local, test, and production configuration explicit.
-
-**Do:**
-- Validate required environment variables at startup.
-- Separate API and worker configuration where necessary.
-- Set database pool limits and timeouts deliberately.
-- Ensure URLs and secrets are not written to logs unnecessarily.
-- Configure HTTP server, outbound client, database, and shutdown timeouts.
-- Document migrations and startup ordering.
-
-**Done when:**
-- A missing required setting causes a clear startup error.
-- No secret is needed in source code.
-- Both API and worker have predictable shutdown behavior.
-
-## Step 19 - Add structured logs, metrics, and health checks
-
-**Goal:** Make the service diagnosable without attaching a debugger.
-
-**Do:**
-- Use `slog` with consistent structured fields.
-- Log request/job IDs where useful, monitor ID, result, duration, retry count, and failure category.
-- Add metrics for checks attempted/succeeded/failed, check latency, queue depth or age, job retries, and alert failures.
-- Keep labels bounded: do not use raw URLs, user IDs, or other unbounded values as metric labels.
-- Define readiness and liveness behavior for API and worker.
-
-**Think about:** Logs explain individual events; metrics reveal aggregate behavior and trends.
-
-**Done when:**
-- You can identify a failed check and follow its processing path.
-- Metrics can show failure rate and queue backlog.
-- Metrics endpoints do not expose secrets or sensitive user data.
-
-## Step 20 - Build a meaningful test suite
-
-**Goal:** Verify behavior, ownership, concurrency, and recovery.
-
-**Do:**
-- Unit-test checker classification, interval rules, incident transitions, retry policy, and validation.
-- Integration-test database queries and migrations against PostgreSQL.
-- API-test authentication, CRUD, ownership, pagination, and error responses.
-- Test concurrent job claiming and expired-lease recovery.
-- Run `go test ./...`, `go test -race ./...`, and `go vet ./...`.
-- Add tests for regressions whenever a real bug is found.
-
-**Done when:**
-- Core business rules have automated tests.
-- Integration tests can be run from documented commands.
-- The race detector and vet pass for the project.
-- No test requires hitting an uncontrolled public website.
-
-## Step 21 - Containerize and run the complete stack locally
-
-**Goal:** Make a reproducible local environment.
-
-**Do:**
-- Create a multi-stage Dockerfile or equivalent images for the API and worker.
-- Add Docker Compose services for PostgreSQL, API, and worker.
-- Use health checks and explicit dependency readiness rather than assuming container startup means the database is ready.
-- Keep persistent database data in a volume.
-- Use a non-root runtime user where practical.
-- Document migration execution and local reset procedures.
-
-**Done when:**
-- A new developer can start the complete stack from the README.
-- API and worker are separate processes.
-- Data survives a container restart.
-- A clean checkout can be built without machine-specific files.
-
-## Step 22 - Add CI and deploy
-
-**Goal:** Prove that the project can be built and run outside your development machine.
-
-**Do:**
-- Add CI for formatting checks, tests, race tests where practical, vet, and build.
-- Choose a hosting setup that can run a persistent worker and PostgreSQL; confirm platform limitations before choosing it.
-- Configure secrets through the hosting platform.
-- Apply migrations using a controlled deployment step.
-- Verify health endpoints and test a real monitor after deployment.
-- Document rollback and database backup limitations for the chosen hosting setup.
-
-**Done when:**
-- CI runs on pushes and pull requests.
-- The deployed API is reachable.
-- A deployed worker performs checks and saves history.
-- You have tested a restart and verified the system recovers.
-
-## Step 23 - Document the system like an engineer
-
-**Goal:** Make the project understandable and credible in a code review or interview.
-
-**Do:**
-- Write a README covering the product, features, local setup, environment variables, migrations, tests, and deployment.
-- Add an architecture diagram and a sequence diagram for one monitor check.
-- Document job states, lease expiry, retries, idempotency, and incident rules.
-- Record key trade-offs: PostgreSQL queue versus a broker, bounded concurrency, retention, and what would change at higher scale.
-- Include screenshots and a short demo.
-- Document known limitations honestly.
-
-**Done when:**
-- Someone can run the project without asking you for missing steps.
-- You can explain the complete lifecycle from monitor creation to check result to alert.
-- The README describes implemented behavior, not future aspirations.
-
-## Step 24 - Final acceptance test and freeze
-
-**Goal:** Finish the defined product rather than expanding it indefinitely.
-
-Run the following end-to-end scenario:
-
-1. Start the stack from a clean environment.
-2. Register two users.
-3. Create monitors for both users.
-4. Confirm ownership boundaries by attempting cross-user access.
-5. Run multiple worker processes and confirm jobs are coordinated.
-6. Make a test target return success, then fail repeatedly, then recover.
-7. Confirm check history, incident opening/resolution, and webhook notifications.
-8. Restart a worker during claimed work and confirm recovery.
-9. Run the automated test suite and CI.
-10. Verify the deployed dashboard and API, and review logs and metrics.
-11. Complete the README and demo.
-
-**Done when:**
-- All required product behavior works.
-- Security, integration, and recovery tests pass.
-- The application is deployed or the documented deployment limitation is explicit.
-- The repository is clean and the demo is reproducible.
-
-**After Step 24: stop.** Do not add features to this version. Write a short retrospective listing what you learned, what remains limited, and the next project or focused experiment that would teach you the next set of skills.
-
----
-
-## 4. Progress tracker
-
-Mark each step only when its acceptance criteria pass.
-
-- [ ] 01 - Reproducible baseline
-- [ ] 02 - Correct, testable checker
-- [ ] 03 - Bounded concurrency
-- [ ] 04 - PostgreSQL and persistence boundaries
-- [ ] 05 - Gin API skeleton
-- [ ] 06 - API contract
-- [ ] 07 - Authentication
-- [ ] 08 - Monitor CRUD and ownership
-- [ ] 09 - Check history
-- [ ] 10 - Scheduling rules
-- [ ] 11 - Durable PostgreSQL job queue
-- [ ] 12 - Separate worker executable
-- [ ] 13 - Crash recovery, retries, idempotency
-- [ ] 14 - Multi-process coordination tests
-- [ ] 15 - Incident state transitions
-- [ ] 16 - Webhook alerts
-- [ ] 17 - Dashboard
-- [ ] 18 - Configuration and operational safety
-- [ ] 19 - Logs, metrics, health
-- [ ] 20 - Test suite
-- [ ] 21 - Docker Compose
-- [ ] 22 - CI and deployment
-- [ ] 23 - Engineering documentation
-- [ ] 24 - Final acceptance and freeze
-
-## 5. Rules against endless perfection
-
-1. **Acceptance criteria beat vague quality goals.** “Production-grade” does not mean every conceivable feature. It means the defined behavior is secure enough for the intended scope, tested, observable, documented, and deployable.
-2. **One fix, one reason.** Refactor when it removes duplication, clarifies ownership, fixes a demonstrated issue, or enables a required test-not merely because another pattern exists.
-3. **No unplanned infrastructure.** A new service or dependency needs a written problem statement and a reason the current design cannot meet the requirement.
-4. **No premature scale claims.** Test realistic local loads and describe measured results. Do not claim internet-scale reliability based on a portfolio deployment.
-5. **Finish the vertical slice.** A small complete feature is more valuable than several half-built abstractions.
-6. **Record learning separately from implementation.** Each step should leave you with a short explanation of the concept and its trade-offs.
-7. **Freeze after Step 24.** Bugs and security defects can still be fixed, but new product ideas go into a future-version list.
-
-## 6. The reasoning checklist
-
-Before implementing any component, answer:
-
-- What input does it receive?
-- What output or state change does it produce?
-- Who owns this responsibility?
-- What state must survive a restart?
-- What happens if it times out or crashes?
-- Can the operation run twice?
-- Can multiple goroutines or processes execute it concurrently?
-- What limits resource usage?
-- How will we test the failure path?
-- What evidence tells us the step is complete?
-
-**Start at Step 1.** Do not start the Gin rewrite or distributed-worker implementation until the current baseline and checker behavior are understood. GORM is the planned ORM for ordinary persistence; Goose remains responsible for versioned schema migrations.
+The checker performs one HTTP probe and returns a result. It must not
+know about Gin, authentication, or database storage. The API does not
+perform scheduled checks in user-facing requests.
+
+------------------------------------------------------------------------
+
+# Phase A: Stabilize the existing checker
+
+## Step 1: Establish a reproducible baseline
+
+**Goal:** Know what exists and make it easy to run again.
+
+### Substeps
+
+-   [ ] From the repository root, inspect the directory tree and
+    identify the Go module directory.
+-   [ ] Record the Go version with `go version`.
+-   [ ] From the module directory, record the module path and direct
+    dependencies using `go.mod` and `go list -m`.
+-   [ ] Run the current program using the documented working directory
+    and command.
+-   [ ] Inspect recent SQLite rows using the existing read function or
+    database viewer.
+-   [ ] Run `go test ./...`.
+-   [ ] Run `go vet ./...`.
+-   [ ] Write down existing failures instead of disguising them as new
+    regressions.
+-   [ ] Add a short README section explaining what the current program
+    does, how to run it, and what it does not do.
+-   [ ] Commit the baseline.
+
+**Verify:** Another run from the documented directory produces
+understandable output. You can explain the order in which `main` opens
+the database, migrates, checks URLs, saves results, and reads history.
+
+**Known gaps to record:** one-shot execution, unused ticker, hardcoded
+URLs, no users/API, and SQLite concurrent-write locking.
+
+## Step 2: Make one HTTP check correct and testable
+
+**Goal:** A single HTTP probe has clear behavior independent of
+persistence and scheduling.
+
+### Substeps
+
+-   [ ] Keep a result struct with URL, check time, status
+    classification, duration, HTTP status code, and error/failure
+    reason.
+-   [ ] Keep `checkURL` separate from database and API code.
+-   [ ] Pass in a reusable `*http.Client` instead of creating a client
+    for each URL.
+-   [ ] Configure a finite client timeout.
+-   [ ] Ensure response bodies are closed with `defer resp.Body.Close()`
+    after a response is received.
+-   [ ] Distinguish an HTTP response from a transport failure. For
+    example, HTTP 500 is a response with a status code, not a network
+    error.
+-   [ ] Decide and document the initial classification rule: response
+    codes below 400 are `UP`, response codes 400 or higher are `DOWN`.
+-   [ ] Test HTTP 200 returns `UP`, no error, and status code 200.
+-   [ ] Test HTTP 500 returns `DOWN`, no transport error, and status
+    code 500.
+-   [ ] Test an invalid URL returns `DOWN` with an error and status code
+    0.
+-   [ ] Test a slow local server with a shorter client timeout. Expect
+    `DOWN`, a non-nil error, and status code 0.
+-   [ ] Test a connection failure using a controlled local test setup.
+    Expect `DOWN` and an error.
+-   [ ] Run `go test -v ./cmd/pulse` and `go vet ./...`.
+
+**Verify:** Tests do not depend on public websites. The checker has no
+database or Gin dependency. HTTP status and transport errors remain
+distinct.
+
+**Stop condition:** Once these behaviors pass, do not keep refactoring
+the checker unless a later requirement needs it.
+
+## Step 3: Introduce bounded concurrency
+
+**Goal:** Run multiple checks concurrently without creating unlimited
+work or racing shared resources.
+
+### Substeps
+
+-   [ ] Keep a sequential version or a small test baseline so
+    concurrency benefits can be compared.
+-   [ ] Choose one limit mechanism: a fixed worker pool or a semaphore.
+    Use a fixed worker pool for the first version.
+-   [ ] Add a configuration value for maximum simultaneous checks, with
+    a safe default and validation.
+-   [ ] Create a jobs channel that carries target URLs or monitor work
+    items.
+-   [ ] Start no more workers than the configured limit.
+-   [ ] Make each worker call the checker and return or persist a result
+    through a clearly owned path.
+-   [ ] Close the jobs channel when no more work is being submitted.
+-   [ ] Wait for workers to finish before returning from a round.
+-   [ ] Decide how cancellation affects queued and in-flight work. Use
+    contexts where appropriate.
+-   [ ] Do not let several goroutines write concurrently to SQLite
+    without an intentional serialization strategy. Since PostgreSQL is
+    planned next, keep any temporary SQLite workaround small.
+-   [ ] Add a test that proves active checks never exceed the configured
+    maximum.
+-   [ ] Run `go test ./...`, `go test -race ./...`, and `go vet ./...`.
+
+**Verify:** The worker count is bounded, all submitted work is either
+completed or cancelled according to policy, and race detection passes
+for tested paths.
+
+**Concepts to understand:** goroutine, channel, `WaitGroup`, concurrency
+versus parallelism, race, cancellation, and resource limits.
+
+## Step 4: Replace SQLite with PostgreSQL and define persistence boundaries
+
+**Goal:** Use PostgreSQL for durable product data and GORM for ordinary
+database operations.
+
+### Substeps
+
+-   [ ] Add a Compose service for PostgreSQL with a named persistent
+    volume and health check.
+-   [ ] Add local environment configuration using placeholders, not
+    committed secrets.
+-   [ ] Add Goose and create the first versioned SQL migration.
+-   [ ] Define only the initial tables needed now, starting with users
+    and monitors when their implementation steps arrive. Add check
+    history, jobs, and incidents in their respective steps rather than
+    speculatively.
+-   [ ] Add primary keys, foreign keys, `NOT NULL`, uniqueness
+    constraints, timestamps, and indexes justified by expected queries.
+-   [ ] Add GORM and its PostgreSQL driver.
+-   [ ] Create a small database initialization function that reads
+    configuration, opens GORM, and verifies connectivity.
+-   [ ] Keep schema changes in Goose migrations. Do not use GORM
+    `AutoMigrate` as the schema migration system.
+-   [ ] Implement a basic create/read/update/delete flow through GORM
+    and check every returned error.
+-   [ ] Inspect generated SQL at least once and learn how to enable GORM
+    debug logging locally.
+-   [ ] Learn when a transaction is necessary for a multi-operation
+    change.
+-   [ ] Keep raw SQL available for PostgreSQL-specific operations such
+    as job claiming with `FOR UPDATE SKIP LOCKED`.
+-   [ ] Verify migrations from an empty database and document how to
+    apply and roll back them.
+
+**Verify:** PostgreSQL starts locally, Goose creates the schema, GORM
+connects and performs tested CRUD, and the checker remains independent
+of storage.
+
+------------------------------------------------------------------------
+
+# Phase B: Build the API
+
+## Step 5: Create the Gin API skeleton
+
+**Goal:** Start a controlled HTTP server with configuration and shutdown
+behavior.
+
+### Substeps
+
+-   [ ] Create `cmd/pulse-api` as the API entry point.
+-   [ ] Move reusable code into packages only when there is a real
+    caller or clear responsibility.
+-   [ ] Define configuration fields for port, database connection,
+    environment, and relevant timeouts.
+-   [ ] Load environment variables and validate required values at
+    startup.
+-   [ ] Fail with a clear startup error when required configuration is
+    missing or invalid.
+-   [ ] Create a Gin router and register a minimal route.
+-   [ ] Add request logging, request IDs, and panic recovery.
+-   [ ] Create an `http.Server` with explicit read, write, idle, and
+    header timeouts where appropriate.
+-   [ ] Add `GET /health/live` to report that the process is alive.
+-   [ ] Add `GET /health/ready` to verify dependencies that the API
+    actually requires.
+-   [ ] Handle SIGINT/SIGTERM with a signal-aware context and graceful
+    server shutdown.
+-   [ ] Add a test for a health route and one invalid configuration
+    case.
+
+**Verify:** The API starts predictably, health endpoints have distinct
+documented meanings, and shutdown is graceful.
+
+## Step 6: Define the monitor API contract
+
+**Goal:** Agree on request and response formats before building all
+handlers.
+
+### Substeps
+
+-   [ ] List the routes needed for create, list, get, update,
+    enable/disable, and delete.
+-   [ ] Define request structs separately from database models.
+-   [ ] Define response structs separately from database models.
+-   [ ] Choose consistent JSON names and a consistent error response
+    format.
+-   [ ] Validate URL scheme and host. Accept only HTTP and HTTPS.
+-   [ ] Validate interval minimum and maximum, input lengths, and
+    required fields.
+-   [ ] Decide pagination parameters and ordering for monitor history.
+-   [ ] Choose status codes for success, invalid input, unauthenticated,
+    forbidden/not found, conflict, and internal errors.
+-   [ ] Write a minimal OpenAPI document or route contract.
+-   [ ] Exercise sample requests with curl or an API client.
+
+**Verify:** Each route has a documented method, path, input, output, and
+error behavior. Invalid inputs are rejected consistently.
+
+## Step 7: Add users and authentication
+
+**Goal:** Identify callers safely so every monitor can have an owner.
+
+### Substeps
+
+-   [ ] Add a Goose migration for users with a unique normalized email
+    or username, password hash, and timestamps.
+-   [ ] Choose a maintained password-hashing library and safe
+    parameters.
+-   [ ] Implement registration, including duplicate-account handling.
+-   [ ] Implement login without revealing whether an account exists in
+    unnecessary detail.
+-   [ ] Choose one authentication approach for v1: secure server-side
+    sessions or short-lived access tokens with a deliberately designed
+    refresh mechanism.
+-   [ ] Store secrets only in environment configuration.
+-   [ ] Add authentication middleware that validates credentials and
+    attaches a user identity to request context.
+-   [ ] Ensure passwords, tokens, and secrets are never logged.
+-   [ ] Test successful registration/login, duplicate registration,
+    wrong password, missing credentials, invalid credentials, and expiry
+    where applicable.
+
+**Verify:** Passwords are never stored in plaintext and protected
+endpoints reject unauthenticated requests.
+
+## Step 8: Implement monitor CRUD and ownership
+
+**Goal:** Users can manage only their own monitors.
+
+### Substeps
+
+-   [ ] Add a Goose migration for monitors with owner ID, URL, name if
+    needed, interval, enabled state, and timestamps.
+-   [ ] Add the user foreign key and constraints.
+-   [ ] Implement create using the authenticated user ID, not a user ID
+    trusted from the request body.
+-   [ ] Implement list scoped to the authenticated user.
+-   [ ] Implement get scoped by both monitor ID and owner ID.
+-   [ ] Implement update with validation.
+-   [ ] Implement enable/disable.
+-   [ ] Implement delete with an explicit policy for related jobs and
+    history.
+-   [ ] Handle not-found, invalid input, duplicate/conflict, and
+    database errors.
+-   [ ] Use a transaction if an operation changes multiple related
+    records that must remain consistent.
+-   [ ] Test every operation and test that User A cannot read, update,
+    or delete User B's monitor.
+
+**Verify:** CRUD works and ownership is enforced in database queries,
+not merely hidden in the UI.
+
+## Step 9: Store and query check history
+
+**Goal:** Persist check results and expose reliable history and latest
+status.
+
+### Substeps
+
+-   [ ] Add a migration for check results linked to a monitor.
+-   [ ] Store check time, classification, latency, HTTP status code when
+    available, and a bounded/sanitized failure reason.
+-   [ ] Add an index matching monitor history queries, such as monitor
+    ID plus check time.
+-   [ ] Persist a result after a check completes.
+-   [ ] Implement latest-status retrieval.
+-   [ ] Implement a paginated history endpoint ordered by check time and
+    a stable tie-breaker.
+-   [ ] Enforce monitor ownership in history queries.
+-   [ ] Define a basic retention policy for v1.
+-   [ ] Test persistence across process restart, latest status,
+    pagination, and cross-user isolation.
+
+**Verify:** Results survive restarts, latest status is correct, and
+history is paginated and access-controlled.
+
+------------------------------------------------------------------------
+
+# Phase C: Scheduling and workers
+
+## Step 10: Specify scheduling rules
+
+**Goal:** Decide scheduling behavior before implementing the scheduler.
+
+### Substeps
+
+-   [ ] Define the minimum and maximum permitted monitor interval.
+-   [ ] Define the first scheduled time when a monitor is created or
+    enabled.
+-   [ ] Define how the next check time is calculated.
+-   [ ] Define what happens when a monitor is disabled, deleted, or
+    edited while work is pending.
+-   [ ] Decide how missed intervals behave. For v1, skip accumulated
+    missed intervals instead of creating an unlimited backlog.
+-   [ ] Draw the path from monitor creation/update to a due job to a
+    completed check.
+-   [ ] Decide which scheduling state must survive process restart.
+-   [ ] Write these rules down before coding.
+
+**Verify:** Scheduling rules fit on one page and define restart behavior
+and missed intervals.
+
+## Step 11: Build a durable PostgreSQL job queue
+
+**Goal:** Store scheduled work so it survives crashes and can be claimed
+by multiple workers.
+
+### Substeps
+
+-   [ ] Add a jobs migration with job ID, monitor ID, scheduled time,
+    state, attempt count, lease expiry, and timestamps as needed.
+-   [ ] Define legal states and state transitions.
+-   [ ] Add indexes for due and claimable jobs.
+-   [ ] Implement safe job creation and rescheduling so repeated
+    scheduler passes do not create unlimited duplicates.
+-   [ ] Claim jobs in a short transaction using `FOR UPDATE SKIP LOCKED`
+    where appropriate.
+-   [ ] Use GORM for ordinary CRUD and parameterized raw SQL for the
+    claim operation if clearer.
+-   [ ] Commit the claim before making the HTTP request.
+-   [ ] Never keep a database transaction open during network I/O.
+-   [ ] Define lease expiry and recovery behavior.
+-   [ ] Add integration tests with PostgreSQL for competing claims.
+
+**Verify:** Two worker processes do not normally claim the same active
+job, claims are recoverable, and no transaction is held during a probe.
+
+## Step 12: Create the separate worker executable
+
+**Goal:** Run API and background work independently from the same
+repository.
+
+### Substeps
+
+-   [ ] Add `cmd/pulse-worker`.
+-   [ ] Reuse shared checker, configuration, database, and domain code
+    without importing Gin into the worker.
+-   [ ] Implement a dispatcher that looks for due jobs.
+-   [ ] Feed claimed work to a bounded pool.
+-   [ ] Apply request contexts and timeouts to every probe.
+-   [ ] Persist check results.
+-   [ ] Update scheduling state and create the next job according to
+    Step 10.
+-   [ ] Add worker liveness/readiness behavior.
+-   [ ] Handle graceful shutdown so no new work is claimed after
+    shutdown begins.
+-   [ ] Run API and worker in separate terminals and verify they use the
+    same PostgreSQL database.
+
+**Verify:** API and worker can run independently. Restarting the worker
+does not erase queued work or history.
+
+## Step 13: Handle crashes, leases, retries, and duplicate delivery
+
+**Goal:** Recover work after failures and make repeated delivery safe.
+
+### Substeps
+
+-   [ ] Recover jobs whose lease expired after a worker crash.
+-   [ ] Define retryable versus permanent failures.
+-   [ ] Add bounded retry attempts and backoff.
+-   [ ] Ensure repeated processing does not create duplicate logical
+    check results or corrupt monitor state.
+-   [ ] Document the idempotency key or guarded state transition used.
+-   [ ] Decide what shutdown does with in-flight jobs: finish within a
+    deadline, cancel, or let lease expiry recover them.
+-   [ ] Test a worker stopping after claim, a probe timeout, a database
+    interruption, and retry exhaustion.
+-   [ ] Log failures with job ID and attempt number, without leaking
+    secrets.
+
+**Verify:** Expired claims recover, retries are bounded, duplicate
+delivery is safe, and the behavior is documented. Do not claim
+exactly-once execution.
+
+## Step 14: Test multi-process coordination
+
+**Goal:** Prove coordination works across independent processes.
+
+### Substeps
+
+-   [ ] Prepare an integration-test setup with PostgreSQL.
+-   [ ] Insert more due jobs than one worker can handle at once.
+-   [ ] Start two worker instances against the same database.
+-   [ ] Verify jobs are claimed and recorded without duplicate active
+    claims.
+-   [ ] Stop a worker while it owns a job.
+-   [ ] Wait for lease expiry and verify another worker recovers the
+    job.
+-   [ ] Test under database contention.
+-   [ ] Record practical limits of the PostgreSQL queue.
+
+**Verify:** A repeatable test demonstrates multi-worker processing and
+crash recovery.
+
+------------------------------------------------------------------------
+
+# Phase D: Incidents, alerts, and dashboard
+
+## Step 15: Implement incident state transitions
+
+**Goal:** Convert repeated check observations into incident state.
+
+### Substeps
+
+-   [ ] Define the v1 policy, for example open after three consecutive
+    failures and resolve after a successful check.
+-   [ ] Add an incidents migration with monitor ID, start time,
+    resolution time, and summary fields.
+-   [ ] On each check result, evaluate the policy for that monitor.
+-   [ ] Ensure repeated failures do not create multiple active incidents
+    for the same monitor.
+-   [ ] Resolve the active incident when the recovery condition is met.
+-   [ ] Use transactions or guarded updates where concurrent workers
+    could conflict.
+-   [ ] Test failure threshold, continued failures, recovery, and a
+    later new outage.
+
+**Verify:** One outage produces one active incident, recovery resolves
+it, and a later outage can open a new incident.
+
+## Step 16: Send webhook alerts
+
+**Goal:** Notify users about incident opening and recovery without
+blocking monitoring.
+
+### Substeps
+
+-   [ ] Define how users configure and update a webhook destination.
+-   [ ] Validate destination scheme and ownership.
+-   [ ] Address server-side request forgery risks by restricting unsafe
+    destinations and documenting remaining limits.
+-   [ ] Create alert work independently from the check result
+    persistence path.
+-   [ ] Send incident-open and incident-resolved notifications with
+    request timeouts.
+-   [ ] Add bounded retries and record delivery outcome.
+-   [ ] Sanitize logs and never log webhook secrets or tokens.
+-   [ ] Test success, timeout, non-success response, retry, and
+    exhausted retries.
+-   [ ] Verify a failed webhook does not lose the check result or crash
+    the worker.
+
+**Verify:** Incident events generate notifications and failures remain
+bounded and observable.
+
+## Step 17: Build the dashboard
+
+**Goal:** Make Pulse usable without curl.
+
+### Substeps
+
+-   [ ] Choose the simplest frontend approach that fits the current
+    backend.
+-   [ ] Build registration and login screens.
+-   [ ] Build a monitor list showing name/URL, current status, last
+    check, latency, and incident state.
+-   [ ] Build the create/edit monitor form.
+-   [ ] Build a monitor detail page with recent history.
+-   [ ] Add loading, empty, validation-error, and API-error states.
+-   [ ] Make status understandable without relying only on color.
+-   [ ] Verify a narrow screen layout.
+-   [ ] Use backend-confirmed state rather than inventing client-side
+    status.
+
+**Verify:** A user can register, create a monitor, see current status,
+and inspect history through the UI.
+
+------------------------------------------------------------------------
+
+# Phase E: Production readiness and finish
+
+## Step 18: Complete configuration and operational safety
+
+**Goal:** Make local, test, and deployed configuration explicit.
+
+### Substeps
+
+-   [ ] List every configuration value used by API and worker.
+-   [ ] Mark which values are required and which have safe defaults.
+-   [ ] Validate types, ranges, URLs, and required secrets at startup.
+-   [ ] Provide `.env.example` with placeholders only.
+-   [ ] Set database pool limits and connection timeouts deliberately.
+-   [ ] Configure inbound server and outbound checker timeouts.
+-   [ ] Ensure sensitive values are not logged.
+-   [ ] Document migration and startup ordering.
+-   [ ] Test missing and malformed configuration.
+
+**Verify:** Missing required settings fail clearly, secrets are not in
+source control, and shutdown is predictable.
+
+## Step 19: Add structured logs, metrics, and health
+
+**Goal:** Diagnose behavior without attaching a debugger.
+
+### Substeps
+
+-   [ ] Use `slog` with structured fields.
+-   [ ] Include useful request/job IDs, monitor ID, result, duration,
+    retry count, and failure category.
+-   [ ] Add counters for checks attempted, successful, and failed.
+-   [ ] Add a latency histogram.
+-   [ ] Add queue depth/age, retry, and alert-failure metrics.
+-   [ ] Keep metric labels bounded. Never label by raw URL or arbitrary
+    user ID.
+-   [ ] Define API and worker liveness/readiness semantics.
+-   [ ] Ensure diagnostics do not expose credentials or private data.
+-   [ ] Verify a simulated failure is visible in logs and metrics.
+
+**Verify:** You can follow a failed check and see aggregate failures and
+queue backlog.
+
+## Step 20: Complete the test suite
+
+**Goal:** Protect the important product behavior against regression.
+
+### Substeps
+
+-   [ ] Unit-test checker classification, URL validation, interval
+    rules, incident transitions, and retry policy.
+-   [ ] Integration-test Goose migrations and GORM operations against
+    PostgreSQL.
+-   [ ] API-test authentication, CRUD, ownership, pagination, and
+    errors.
+-   [ ] Test concurrent job claiming and expired-lease recovery.
+-   [ ] Ensure tests use local controlled servers, not uncontrolled
+    public websites.
+-   [ ] Add a regression test whenever a real bug is fixed.
+-   [ ] Run `go test ./...`.
+-   [ ] Run `go test -race ./...` where supported and useful.
+-   [ ] Run `go vet ./...`.
+-   [ ] Build API and worker.
+
+**Verify:** Core rules are tested and all documented test commands work.
+
+## Step 21: Containerize the complete stack
+
+**Goal:** Start the project from a clean checkout using repeatable
+commands.
+
+### Substeps
+
+-   [ ] Add a multi-stage Dockerfile or separate appropriate build
+    targets for API and worker.
+-   [ ] Add Compose services for PostgreSQL, API, and worker.
+-   [ ] Configure database health checks and dependency readiness.
+-   [ ] Persist PostgreSQL data in a named volume.
+-   [ ] Run application processes as a non-root user where practical.
+-   [ ] Document migration execution and safe local reset.
+-   [ ] Verify environment values are passed without committing secrets.
+-   [ ] Start the stack from a clean state and exercise one monitor.
+-   [ ] Restart containers and verify data survives.
+
+**Verify:** A clean checkout can start the stack with documented
+commands, and API and worker remain separate processes.
+
+## Step 22: Add CI and deploy
+
+**Goal:** Build and run the product outside the development machine.
+
+### Substeps
+
+-   [ ] Add CI for formatting, tests, vet, and build.
+-   [ ] Add race testing if supported and practical in CI.
+-   [ ] Select a host that supports a persistent worker and PostgreSQL.
+-   [ ] Confirm platform limits before committing to the host.
+-   [ ] Configure secrets using the host's secret management.
+-   [ ] Run migrations as a controlled deployment step.
+-   [ ] Deploy API and worker.
+-   [ ] Verify health endpoints and run a test monitor.
+-   [ ] Restart the worker and verify recovery.
+-   [ ] Document backup and rollback limitations.
+
+**Verify:** CI runs on pushes and pull requests, and deployed monitoring
+works end to end.
+
+## Step 23: Write engineering documentation
+
+**Goal:** Let another developer understand, run, and review Pulse.
+
+### Substeps
+
+-   [ ] Write a README covering purpose, features, prerequisites, local
+    setup, configuration, migrations, tests, and deployment.
+-   [ ] Add an architecture diagram.
+-   [ ] Add a sequence diagram for a scheduled monitor check.
+-   [ ] Document job states, leases, expiry, retries, and idempotency.
+-   [ ] Document incident thresholds and alert behavior.
+-   [ ] Explain trade-offs: PostgreSQL queue, bounded concurrency,
+    retention, and limits at higher scale.
+-   [ ] Include screenshots and a short demo.
+-   [ ] List known limitations honestly.
+-   [ ] Verify instructions from a clean checkout or a separate clone if
+    practical.
+
+**Verify:** Someone else can run the project and understand the full
+monitor lifecycle without asking for missing steps.
+
+## Step 24: Final acceptance test and freeze
+
+**Goal:** Prove the promised v1 behavior and stop adding scope.
+
+### Substeps
+
+-   [ ] Start the stack from a clean environment.
+-   [ ] Register two users.
+-   [ ] Create monitors for both users.
+-   [ ] Attempt cross-user reads and mutations and confirm they are
+    rejected.
+-   [ ] Run multiple workers and verify coordinated job claiming.
+-   [ ] Use a controlled target that returns success, then repeated
+    failures, then recovery.
+-   [ ] Verify history and latest status.
+-   [ ] Verify incident opening and resolution.
+-   [ ] Verify webhook notifications and bounded failure behavior.
+-   [ ] Restart a worker during claimed work and verify recovery.
+-   [ ] Run tests and CI.
+-   [ ] Verify deployed API/dashboard, logs, and metrics.
+-   [ ] Finish README and demo.
+-   [ ] Review Git status and ensure no secrets, database files, or
+    build artifacts are committed.
+-   [ ] Write a short retrospective and list future ideas separately.
+
+**Verify:** All required behavior works, important security/recovery
+tests pass, deployment is documented, and the repository is
+reproducible.
+
+**After Step 24, stop.** Fix real bugs and security issues, but put new
+product ideas into a future-version list.
+
+------------------------------------------------------------------------
+
+# Progress tracker
+
+-   [x] Step 1: Baseline and Git checkpoint, according to current
+    working notes
+-   [x] Step 2: Correct, testable checker
+-   [ ] Step 3: Bounded concurrency
+-   [ ] Step 4: PostgreSQL and persistence boundaries
+-   [ ] Step 5: Gin API skeleton
+-   [ ] Step 6: API contract
+-   [ ] Step 7: Authentication
+-   [ ] Step 8: Monitor CRUD and ownership
+-   [ ] Step 9: Check history
+-   [ ] Step 10: Scheduling rules
+-   [ ] Step 11: Durable PostgreSQL job queue
+-   [ ] Step 12: Separate worker executable
+-   [ ] Step 13: Crash recovery, retries, and idempotency
+-   [ ] Step 14: Multi-process coordination
+-   [ ] Step 15: Incident transitions
+-   [ ] Step 16: Webhook alerts
+-   [ ] Step 17: Dashboard
+-   [ ] Step 18: Configuration and operational safety
+-   [ ] Step 19: Logs, metrics, and health
+-   [ ] Step 20: Test suite
+-   [ ] Step 21: Docker Compose
+-   [ ] Step 22: CI and deployment
+-   [ ] Step 23: Documentation
+-   [ ] Step 24: Final acceptance and freeze
+
+## Rules against endless perfection
+
+1.  Acceptance criteria beat vague quality goals.
+2.  Fix issues that block the current step. Record non-blocking issues
+    and return when their planned step arrives.
+3.  A refactor needs a concrete reason: a demonstrated bug, duplication,
+    unclear ownership, or a required feature/test.
+4.  No new infrastructure without a specific problem it solves.
+5.  Complete a vertical slice rather than starting many abstractions.
+6.  Keep learning notes short: concept, design choice, failure mode.
+7.  Do not claim exactly-once job execution. Design for retries and
+    idempotent effects.
+8.  Freeze scope after Step 24.

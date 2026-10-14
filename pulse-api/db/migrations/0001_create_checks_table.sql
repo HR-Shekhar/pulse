@@ -1,5 +1,4 @@
--- Creates the checks history table when it does not already exist.
--- Each row is one URL check: when it ran, the result, the latency, and any error text.
+-- Create the checks history table if missing.
 CREATE TABLE IF NOT EXISTS checks (
   id INTEGER PRIMARY KEY AUTOINCREMENT,
   checked_at TIMESTAMP,
